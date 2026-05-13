@@ -161,10 +161,7 @@ func (auth *AuthService) CheckUserPassword(search model.UserSearch, password str
 				return fmt.Errorf("failed to bind to ldap user: %w", err)
 			}
 
-			err = auth.ldap.BindService(true)
-			if err != nil {
-				return fmt.Errorf("failed to bind to ldap service account: %w", err)
-			}
+
 
 			return nil
 		}
