@@ -50,18 +50,7 @@ func NewLdapService(
 		log.App.Info().Msg("LDAP mTLS authentication configured successfully")
 
 		ldap.cert = &cert
-
-
-
-
-
-
-
-
-
 	}
-
-
 
 	_, err := ldap.connect()
 
@@ -106,12 +95,6 @@ func (ldap *LdapService) connect() (*ldapgo.Conn, error) {
 	var conn *ldapgo.Conn
 	var err error
 
-
-
-
-
-
-
 	if ldap.cert != nil {
 		conn, err = ldapgo.DialURL(ldap.config.LDAP.Address, ldapgo.DialWithTLSConfig(&tls.Config{
 			MinVersion:   tls.VersionTLS12,
@@ -136,12 +119,12 @@ func (ldap *LdapService) connect() (*ldapgo.Conn, error) {
 	return ldap.conn, nil
 }
 
-// 新增方法：确保连接已绑定
+// ensureBound verifies the connection is alive and rebinds if necessary
 func (ldap *LdapService) ensureBound() error {
 	ldap.mutex.Lock()
 	defer ldap.mutex.Unlock()
 
-	// 测试连接是否有效（发送根 DSE 查询）
+	// Test connection with root DSE query
 	testReq := ldapgo.NewSearchRequest(
 		"",
 		ldapgo.ScopeBaseObject, ldapgo.NeverDerefAliases, 1, 1, false,
@@ -160,7 +143,6 @@ func (ldap *LdapService) ensureBound() error {
 }
 
 func (ldap *LdapService) GetUserInfo(username string) (dn string, email string, err error) {
-	// 确保连接有效并重新绑定
 	if err := ldap.ensureBound(); err != nil {
 		return "", "", err
 	}
@@ -193,7 +175,6 @@ func (ldap *LdapService) GetUserInfo(username string) (dn string, email string, 
 }
 
 func (ldap *LdapService) GetUserGroups(userDN string) ([]string, error) {
-	// 确保连接有效并重新绑定
 	if err := ldap.ensureBound(); err != nil {
 		return nil, err
 	}
@@ -224,7 +205,6 @@ func (ldap *LdapService) GetUserGroups(userDN string) ([]string, error) {
 
 	groups := []string{}
 
-	// I guess it should work for most ldap providers
 	for _, dn := range groupDNs {
 		rdnParts, err := ldapgo.ParseDN(dn)
 		if err != nil {
@@ -240,7 +220,6 @@ func (ldap *LdapService) GetUserGroups(userDN string) ([]string, error) {
 }
 
 func (ldap *LdapService) BindService(rebind bool) error {
-	// Locks must not be used for initial binding attempt
 	if rebind {
 		ldap.mutex.Lock()
 		defer ldap.mutex.Unlock()
@@ -252,7 +231,6 @@ func (ldap *LdapService) BindService(rebind bool) error {
 	} else {
 		err = ldap.conn.Bind(ldap.config.LDAP.BindDN, ldap.config.LDAP.BindPassword)
 	}
-
 	if err != nil {
 		return fmt.Errorf("LDAP bind failed: %w", err)
 	}
@@ -271,29 +249,10 @@ func (ldap *LdapService) Bind(userDN string, password string) error {
 
 func (ldap *LdapService) heartbeat() error {
 	ldap.log.App.Debug().Msg("Performing LDAP connection heartbeat")
-	return ldap.ensureBound() // 直接复用 ensure}
+	return ldap.ensureBound()
+}
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-funcBound
-
-
-
-
- (ldap *LdapService) reconnect() error {
+func (ldap *LdapService) reconnect() error {
 	ldap.log.App.Info().Msg("Attempting to reconnect to LDAP server")
 
 	exp := backoff.NewExponentialBackOff()
@@ -308,16 +267,8 @@ funcBound
 
 		if ldap.conn != nil {
 			ldap.conn.Close()
-
-
-
 		}
-		conn, err := ldap.connect() // connect() 内部会调用 BindService
-
-
-
-
-
+		conn, err := ldap.connect()
 		if err != nil {
 			return err
 		}
