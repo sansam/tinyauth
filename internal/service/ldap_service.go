@@ -19,7 +19,7 @@ type LdapService struct {
 	context context.Context
 
 	conn  *ldapgo.Conn
-	mutex sync.RWMutex
+	mutex sync.Mutex
 	cert  *tls.Certificate
 }
 
@@ -39,22 +39,17 @@ func NewLdapService(
 		context: ctx,
 	}
 
-	// Check whether authentication with client certificate is possible
 	if config.LDAP.AuthCert != "" && config.LDAP.AuthKey != "" {
 		cert, err := tls.LoadX509KeyPair(config.LDAP.AuthCert, config.LDAP.AuthKey)
-
 		if err != nil {
 			return nil, fmt.Errorf("failed to initialize LDAP with mTLS authentication: %w", err)
 		}
 
 		log.App.Info().Msg("LDAP mTLS authentication configured successfully")
-
 		ldap.cert = &cert
 	}
 
-	_, err := ldap.connect()
-
-	if err != nil {
+	if err := ldap.dialAndBind(); err != nil {
 		return nil, fmt.Errorf("failed to connect to ldap server: %w", err)
 	}
 
@@ -69,8 +64,7 @@ func NewLdapService(
 		for {
 			select {
 			case <-ticker.C:
-				err := ldap.heartbeat()
-				if err != nil {
+				if err := ldap.heartbeat(); err != nil {
 					ldap.log.App.Warn().Err(err).Msg("LDAP connection heartbeat failed, attempting to reconnect")
 					if reconnectErr := ldap.reconnect(); reconnectErr != nil {
 						ldap.log.App.Error().Err(reconnectErr).Msg("Failed to reconnect to LDAP server")
@@ -88,10 +82,18 @@ func NewLdapService(
 	return ldap, nil
 }
 
-func (ldap *LdapService) connect() (*ldapgo.Conn, error) {
+// dialAndBind establishes a new connection and binds the service account.
+// Caller must NOT hold the mutex.
+func (ldap *LdapService) dialAndBind() error {
 	ldap.mutex.Lock()
 	defer ldap.mutex.Unlock()
 
+	return ldap.dialAndBindLocked()
+}
+
+// dialAndBindLocked establishes a new connection and binds.
+// Caller MUST already hold the mutex.
+func (ldap *LdapService) dialAndBindLocked() error {
 	var conn *ldapgo.Conn
 	var err error
 
@@ -107,24 +109,44 @@ func (ldap *LdapService) connect() (*ldapgo.Conn, error) {
 		}))
 	}
 	if err != nil {
-		return nil, err
+		return fmt.Errorf("failed to dial LDAP: %w", err)
 	}
 
 	ldap.conn = conn
 
-	err = ldap.BindService(false)
-	if err != nil {
-		return nil, err
+	if err := ldap.bindServiceLocked(); err != nil {
+		ldap.conn.Close()
+		ldap.conn = nil
+		return err
 	}
-	return ldap.conn, nil
+
+	return nil
 }
 
-// ensureBound verifies the connection is alive and rebinds if necessary
+// bindServiceLocked binds using the service account credentials.
+// Caller MUST already hold the mutex.
+func (ldap *LdapService) bindServiceLocked() error {
+	var err error
+	if ldap.cert != nil {
+		err = ldap.conn.ExternalBind()
+	} else {
+		err = ldap.conn.Bind(ldap.config.LDAP.BindDN, ldap.config.LDAP.BindPassword)
+	}
+	if err != nil {
+		return fmt.Errorf("LDAP service bind failed: %w", err)
+	}
+	ldap.log.App.Debug().Msg("LDAP service account bound successfully")
+	return nil
+}
+
+// ensureBound verifies the connection is alive and rebinds the service account.
+// If the connection is dead it attempts a full reconnect.
+// Caller must NOT hold the mutex.
 func (ldap *LdapService) ensureBound() error {
 	ldap.mutex.Lock()
 	defer ldap.mutex.Unlock()
 
-	// Test connection with root DSE query
+	// Quick connectivity test via root DSE query
 	testReq := ldapgo.NewSearchRequest(
 		"",
 		ldapgo.ScopeBaseObject, ldapgo.NeverDerefAliases, 1, 1, false,
@@ -132,21 +154,45 @@ func (ldap *LdapService) ensureBound() error {
 		[]string{"namingContexts"},
 		nil,
 	)
-	if _, err := ldap.conn.Search(testReq); err != nil {
-		ldap.log.App.Warn().Err(err).Msg("LDAP connection test failed, rebinding")
-		if bindErr := ldap.BindService(true); bindErr != nil {
-			return fmt.Errorf("failed to rebind LDAP: %w", bindErr)
+
+	_, err := ldap.conn.Search(testReq)
+	if err != nil {
+		ldap.log.App.Warn().Err(err).Msg("LDAP connection test failed, attempting full reconnect")
+
+		if ldap.conn != nil {
+			ldap.conn.Close()
 		}
-		ldap.log.App.Debug().Msg("Successfully rebound LDAP connection")
+
+		if dialErr := ldap.dialAndBindLocked(); dialErr != nil {
+			return fmt.Errorf("LDAP reconnect failed: %w", dialErr)
+		}
+
+		ldap.log.App.Info().Msg("LDAP reconnected and rebound successfully")
+		return nil
 	}
+
+	// Connection is alive, rebind service account to ensure a clean state
+	if bindErr := ldap.bindServiceLocked(); bindErr != nil {
+		return fmt.Errorf("LDAP rebind failed: %w", bindErr)
+	}
+
 	return nil
 }
 
-func (ldap *LdapService) GetUserInfo(username string) (dn string, email string, err error) {
+// searchWithBind ensures the service account is bound, then executes the search.
+// Caller must NOT hold the mutex.
+func (ldap *LdapService) searchWithBind(request *ldapgo.SearchRequest) (*ldapgo.SearchResult, error) {
 	if err := ldap.ensureBound(); err != nil {
-		return "", "", err
+		return nil, err
 	}
 
+	ldap.mutex.Lock()
+	defer ldap.mutex.Unlock()
+
+	return ldap.conn.Search(request)
+}
+
+func (ldap *LdapService) GetUserInfo(username string) (dn string, email string, err error) {
 	escapedUsername := ldapgo.EscapeFilter(username)
 	filter := fmt.Sprintf(ldap.config.LDAP.SearchFilter, escapedUsername)
 
@@ -158,10 +204,7 @@ func (ldap *LdapService) GetUserInfo(username string) (dn string, email string, 
 		nil,
 	)
 
-	ldap.mutex.Lock()
-	defer ldap.mutex.Unlock()
-
-	searchResult, err := ldap.conn.Search(searchRequest)
+	searchResult, err := ldap.searchWithBind(searchRequest)
 	if err != nil {
 		return "", "", err
 	}
@@ -175,10 +218,6 @@ func (ldap *LdapService) GetUserInfo(username string) (dn string, email string, 
 }
 
 func (ldap *LdapService) GetUserGroups(userDN string) ([]string, error) {
-	if err := ldap.ensureBound(); err != nil {
-		return nil, err
-	}
-
 	escapedUserDN := ldapgo.EscapeFilter(userDN)
 
 	searchRequest := ldapgo.NewSearchRequest(
@@ -189,29 +228,20 @@ func (ldap *LdapService) GetUserGroups(userDN string) ([]string, error) {
 		nil,
 	)
 
-	ldap.mutex.Lock()
-	defer ldap.mutex.Unlock()
-
-	searchResult, err := ldap.conn.Search(searchRequest)
+	searchResult, err := ldap.searchWithBind(searchRequest)
 	if err != nil {
-		return []string{}, err
+		return nil, err
 	}
 
-	groupDNs := []string{}
+	groups := make([]string, 0, len(searchResult.Entries))
 
 	for _, entry := range searchResult.Entries {
-		groupDNs = append(groupDNs, entry.DN)
-	}
-
-	groups := []string{}
-
-	for _, dn := range groupDNs {
-		rdnParts, err := ldapgo.ParseDN(dn)
+		rdnParts, err := ldapgo.ParseDN(entry.DN)
 		if err != nil {
-			return []string{}, err
+			return nil, fmt.Errorf("failed to parse DN %s: %w", entry.DN, err)
 		}
 		if len(rdnParts.RDNs) == 0 || len(rdnParts.RDNs[0].Attributes) == 0 {
-			return []string{}, fmt.Errorf("invalid DN format: %s", dn)
+			return nil, fmt.Errorf("invalid DN format: %s", entry.DN)
 		}
 		groups = append(groups, rdnParts.RDNs[0].Attributes[0].Value)
 	}
@@ -219,32 +249,27 @@ func (ldap *LdapService) GetUserGroups(userDN string) ([]string, error) {
 	return groups, nil
 }
 
-func (ldap *LdapService) BindService(rebind bool) error {
-	if rebind {
-		ldap.mutex.Lock()
-		defer ldap.mutex.Unlock()
-	}
+// BindService binds the service account. Safe to call without holding the mutex.
+func (ldap *LdapService) BindService() error {
+	ldap.mutex.Lock()
+	defer ldap.mutex.Unlock()
 
-	var err error
-	if ldap.cert != nil {
-		err = ldap.conn.ExternalBind()
-	} else {
-		err = ldap.conn.Bind(ldap.config.LDAP.BindDN, ldap.config.LDAP.BindPassword)
-	}
-	if err != nil {
-		return fmt.Errorf("LDAP bind failed: %w", err)
-	}
-	return nil
+	return ldap.bindServiceLocked()
 }
 
+// Bind authenticates a user and then rebinds the service account.
 func (ldap *LdapService) Bind(userDN string, password string) error {
 	ldap.mutex.Lock()
 	defer ldap.mutex.Unlock()
-	err := ldap.conn.Bind(userDN, password)
-	if err != nil {
+
+	if err := ldap.conn.Bind(userDN, password); err != nil {
+		// Rebind service account even on failure to keep connection usable
+		_ = ldap.bindServiceLocked()
 		return err
 	}
-	return nil
+
+	// Rebind service account after successful user authentication
+	return ldap.bindServiceLocked()
 }
 
 func (ldap *LdapService) heartbeat() error {
@@ -261,20 +286,21 @@ func (ldap *LdapService) reconnect() error {
 	exp.Multiplier = 1.5
 	exp.Reset()
 
-	operation := func() error {
+	operation := func() (struct{}, error) {
 		ldap.mutex.Lock()
 		defer ldap.mutex.Unlock()
 
 		if ldap.conn != nil {
 			ldap.conn.Close()
 		}
-		conn, err := ldap.connect()
-		if err != nil {
-			return err
+
+		if err := ldap.dialAndBindLocked(); err != nil {
+			return struct{}{}, err
 		}
-		ldap.conn = conn
-		return nil
+
+		return struct{}{}, nil
 	}
 
-	return backoff.Retry(ldap.context, operation, backoff.WithBackOff(exp), backoff.WithMaxTries(3))
+	_, err := backoff.Retry(ldap.context, operation, backoff.WithBackOff(exp), backoff.WithMaxTries(3))
+	return err
 }
